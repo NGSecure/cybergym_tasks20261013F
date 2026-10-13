@@ -1,0 +1,120 @@
+Summary
+=======
+wasm3 (a WebAssembly interpreter) hits an out-of-bounds array access inside
+its bytecode compiler while finishing the compilation of a function body.
+UBSan reports "index -1 out of bounds" on a fixed-size internal bookkeeping
+table. The negative index is not an overflow that grew past the end of the
+table; it is a sentinel "no slot" marker that escapes an internal
+type-narrowing step and gets treated as a real, small negative array index.
+
+Affected path
+=============
+The compiler keeps a small shadow value-stack while it walks a function's
+instructions: for every logical WebAssembly value on the stack it records
+(a) the value's type and (b) which physical "slot" (an index into a
+fixed-size allocation-count table) currently holds it. A dedicated 16-bit
+constant is reserved to mean "this stack entry has no physical slot" (e.g. a
+value that lives only in a register, or a placeholder that has not been
+resolved yet).
+
+When the compiler finishes compiling a structured block (loop/if/block), it
+must restore the block's incoming parameters back onto the shadow stack so
+that the block body can reference them. This restore step looks up, for each
+saved parameter, which slot it previously occupied. On a *stack-polymorphic*
+code path -- i.e. compilation of unreachable code that follows an
+early exit (a branch, return, or similar control transfer out of the current
+block) -- the compiler's notion of "how many live values are currently on the
+stack" can be smaller than what the block's parameter bookkeeping expects.
+Restoring parameters in that state can legitimately end up with "no slot"
+for a parameter that would normally have had one.
+
+Root cause
+==========
+The vulnerable code does not special-case that outcome: the "no slot"
+sentinel is written straight into the shadow stack's per-entry slot field
+exactly like a real slot number would be, and nothing along the two
+consumers of that field distinguishes the sentinel from a legitimate,
+very-large slot number. Later, while unwinding the block's shadow stack
+(freeing slots for values that go out of scope as compiled statements finish
+or as unreachable code is unwound), the routine that releases a slot receives
+this stored value, narrows it from its 16-bit unsigned form into a signed
+16-bit slot index, and uses it directly to index into the allocation-count
+table -- one decrement per slot occupied by the value's type. Because the
+sentinel's unsigned bit pattern is the all-ones value, the signed
+reinterpretation produces exactly -1, so the release routine indexes one
+element *before* the start of the table instead of throwing an error or
+being filtered out beforehand.
+
+The result is an out-of-bounds access at index -1 into the table (a
+read-modify-write, since the operation is an in-place decrement), landing on
+whatever internal state of the compilation context happens to sit
+immediately before that table in memory. This is a sentinel/signed-narrowing
+bug, not a classic "index grew past the buffer" overflow: the defect is a
+missing check that a specific reserved marker value must never be dereferenced
+as a slot index, not an off-by-N miscount that pushes an otherwise valid index
+too high.
+
+Observed crash
+==============
+The reproducer's call path is entirely inside compiling one function: the
+compiler enters a structured block, restores that block's parameters while
+the shadow stack is in the polymorphic state described above, then continues
+compiling the block's remaining statements. When it later has to unwind the
+block's shadow stack (as part of normal statement-by-statement compilation,
+not at function exit), it reaches the tainted stack entry and calls the
+slot-release routine on it, which performs the out-of-bounds table access
+and UBSan aborts on the array-bounds violation.
+
+Directionality (for reviewers)
+==============================
+- Direction: a *negative* underflow (index -1), not a positive/growing
+  overflow. The access is one element before the table's start, not past its
+  end.
+- Read vs. write: both -- the operation is an in-place decrement
+  (`table[i]--`), so it is simultaneously a read and a write at the same bad
+  index.
+- Which "pointer": the table being indexed is a fixed-size, statically-sized
+  member array embedded directly in the per-compilation context object (not
+  a separately heap-allocated buffer and not the shadow value-stack array
+  itself); the out-of-bounds access therefore corrupts/reads adjacent fields
+  of that same context object rather than unrelated heap memory, which is
+  consistent with this crash being reported as a sanitizer-caught
+  bounds violation (verify=0 in the report) rather than a wild-pointer SEGV.
+
+fix_commit assessment
+======================
+The recorded fix reference resolves to a *merge* commit on the upstream
+repository, not an atomic, single-purpose fix. That merge lands two
+independent upstream commits at once: (1) a batch of memory-safety fixes
+(covering several distinct OSS-Fuzz reports against the compiler, one of
+which is exactly the block-parameter-restore-while-polymorphic scenario
+described above, patched by preventing the stack-accounting shrink from
+going further than the block's own baseline, together with a companion
+change that stops the "no slot" sentinel from ever being written into slot
+bookkeeping in the first place) and (2) a completely unrelated fix for
+parsing constant globals on big-endian hosts. The merge also carries several
+no-op documentation/CI-only edits pulled in as part of the same branch sync.
+
+Net assessment: the fix reference is *directionally correct* -- the actual
+guard that removes this crash's precondition is present in the tree it
+points to, and reverting just that guard (while keeping everything else)
+reintroduces the exact precondition described above. However, the reference
+itself is not minimal: it also bundles an unrelated parsing fix and
+non-functional file changes, so attributing "the fix" to this single commit
+overstates its scope. Treat it as "the fix landed no later than this merge,
+alongside unrelated changes" rather than "this commit is a clean, single-bug
+patch."
+
+Relationship to other wasm3 entries in this dataset
+====================================================
+This defect is unrelated to the wasm3 entries already covering a "missing
+stack-overflow check while evaluating a constant/init expression" family
+(distinct fix reference, distinct crash signature: an unrelated-module
+function-table corruption surfaced later as a wild-pointer read). This
+entry's defect lives entirely inside per-function bytecode compilation
+(structured-block parameter bookkeeping and slot deallocation) and never
+touches constant/init-expression evaluation, global-table linking, or
+function lookup at all. The two are different defects in different parts of
+the compiler/runtime, with different fix references and different observable
+crash types (a sanitizer-caught bounds violation here vs. a segmentation
+fault there); this entry is not a duplicate of that family.

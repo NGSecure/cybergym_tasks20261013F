@@ -1,0 +1,140 @@
+Technical root-cause summary (ARVO id 34518, project libvips)
+
+Overview
+--------
+This is a heap-buffer-overflow WRITE reported by AddressSanitizer while decoding a
+crafted JPEG XL (JXL) image. As with other libvips/jxl ARVO ids, the fuzz target name
+("pngsave_buffer_fuzzer") is misleading: the target loads the input as JXL via
+vips_image_new_from_buffer() and the crash happens entirely inside the bundled
+third-party JPEG XL decoder, reached through libvips' JXL foreign-loader glue
+(JxlThreadParallelRunnerCreate -> vips_foreign_load_jxl_buffer_build -> decode).
+Nothing in libvips' own code is implicated.
+
+Trigger path
+------------
+During final frame reconstruction, FinalizeFrameDecoding's per-rect blending callback
+drives jxl::ImageBlender::RectBlender::DoBlending(), which calls
+jxl::PerformBlending() (lib/jxl/blending.cc) once per row of the overlap rectangle
+between a decoded patch/frame and the canvas. PerformBlending() dispatches, per
+channel, into jxl::PerformAlphaWeightedAdd() (lib/jxl/alpha.cc) whenever the patch's
+blend mode is "add" and its alpha channel is the same as the blend-alpha channel
+(fg == fga, i.e. no separate clamping is required). That function is reached from a
+worker thread spawned by JxlThreadParallelRunner, matching the crash backtrace
+(__asan_memcpy -> PerformAlphaWeightedAdd -> PerformBlending -> DoBlending ->
+FinalizeFrameDecoding's lambda -> thread pool).
+
+Root cause
+----------
+Confirmed empirically by pulling n132/arvo:34518-{vul,fix}, extracting
+/src/jpeg-xl/lib/jxl/alpha.cc from both images and diffing them directly (no tarballs
+were present in data/materials at the start of this task; they were fetched fresh via
+`docker create` + `docker cp` against the images named in meta.json).
+
+Vulnerable code, inside PerformAlphaWeightedAdd (lib/jxl/alpha.cc):
+
+    void PerformAlphaWeightedAdd(const float* bg, const float* fg, const float* fga,
+                                  float* out, size_t num_pixels, bool clamp) {
+      if (fg == fga) {
+        memcpy(out, bg, num_pixels * sizeof(out));   // <-- the bug
+      } else {
+        ...
+      }
+    }
+
+`out` is declared as `float*`. `sizeof(out)` is therefore `sizeof(float*)` — the size
+of the pointer itself (8 bytes on the 64-bit ASAN build), not the size of the pointee
+`float` (4 bytes) that the author clearly intended. The memcpy consequently copies
+`num_pixels * 8` bytes instead of the correct `num_pixels * 4` bytes: exactly double
+the number of bytes that `out`'s backing row buffer (a `num_pixels`-float plane row,
+e.g. the 3712-byte/928-float region named in the ASAN allocation record) was sized
+for. Because `fg == fga` is a legitimate, decoder-reachable condition (it occurs
+whenever a patch's "add" blend uses its own alpha channel as the blend-alpha source,
+which a crafted JXL patch/alpha-blending header can force), every such row triggers a
+write that runs exactly `num_pixels * 4` bytes past the end of the destination row's
+heap allocation — the ASAN report's "WRITE of size 592 ... 0 bytes to the right of
+3712-byte region" is a chunked piece of this doubled-length memcpy landing immediately
+in the heap redzone. This is a plain `sizeof(pointer)` vs `sizeof(pointee)` typo, not
+a missing bounds check on attacker-controlled dimensions — the overflow size is a
+constant multiplier (2x) of whatever `num_pixels` the caller legitimately passed, and
+is independent of frame/channel geometry mismatches (contrast with the unrelated
+int_to_float overflow in dec_modular.cc, see cross-check below).
+
+What the real fix does, and where it lives
+-------------------------------------------
+The fix (present in /src/jpeg-xl/lib/jxl/alpha.cc in the -fix image) is the minimal
+one-token correction:
+
+    -    memcpy(out, bg, num_pixels * sizeof(out));
+    +    memcpy(out, bg, num_pixels * sizeof(*out));
+
+`sizeof(*out)` dereferences the pointer type to get `sizeof(float)` (4 bytes), so the
+copy now writes exactly `num_pixels * 4` bytes — matching the destination row's real
+size and eliminating the overflow. This patch sits in the bundled jpeg-xl submodule,
+not in libvips' own source tree, and differs from the recorded fix_commit's file list.
+(Note: a second, unrelated change also differs between the -vul and -fix
+lib/jxl/blending.cc files — a refactor that hoists per-row pointer/stride computation
+out of DoBlending() into a one-time setup, purely a performance change to how row
+pointers are derived; it does not alter any bound, touch PerformAlphaWeightedAdd, or
+affect the crash. It is submodule-version drift between the two OSS-Fuzz build
+snapshots, not part of this bug's fix.)
+
+fix_commit assessment
+----------------------
+The recorded fix_commit (fc8dbfdb441f618441eb7ccb3ea97e92ab445e60, with the handful
+of libvips iofuncs/ low-level I/O source files and the single helper function
+crash.json lists as fix_files/fix_functions) is MISATTRIBUTED and does not
+correspond to this bug. That
+commit only widens a Win32-only `#ifdef G_PLATFORM_WIN32` guard to
+`#if defined(G_PLATFORM_WIN32) || defined(G_WITH_CYGWIN)` around O_BINARY / text-vs-
+binary fopen mode selection in libvips' own I/O helpers — it has nothing to do with
+JPEG XL decoding, alpha blending, or heap bounds. The actual fix that eliminates this
+crash is the `sizeof(out)` -> `sizeof(*out)` one-liner in the bundled jpeg-xl
+lib/jxl/alpha.cc, which entered the libvips "fix" image through an update of the
+vendored jpeg-xl sources, not through the commit recorded as fix_commit. This is the
+same libvips-metadata misattribution pattern already documented for ARVO id 34284
+(which shares this exact recorded fix_commit) — see cross-check below.
+
+Directionality recap
+---------------------
+- Out-of-bounds WRITE (chunked memcpy write past the end of the destination row's
+  heap allocation), not a read.
+- The overflowing object is the destination (`out`) row buffer passed into
+  PerformAlphaWeightedAdd — the background/foreground source planes are read in
+  bounds; only the `out` write runs long.
+- Root trigger is a `sizeof(pointer)` vs `sizeof(pointee)` typo producing a constant
+  2x-oversized copy length, not a missing/incorrect dimension check against a
+  degenerate frame geometry.
+
+Cross-check against ARVO id 34284 (same recorded fix_commit, already shipped)
+-------------------------------------------------------------------------------
+This repo has already shipped libvips id 34284 (data/materials/arvo/34284/), which
+records the identical fix_commit fc8dbfdb441f618441eb7ccb3ea97e92ab445e60 and the
+identical (misattributed) fix_files/fix_functions. Comparing the two crash records
+directly:
+
+  - 34284: crash_function jxl::int_to_float(...) in the jpeg-xl modular decoder's
+    frame-finalization file, crash_type "Heap-buffer-overflow READ 4", a dedup_token
+    rooted at int_to_float / the sequential thread-pool runner. Root cause (per its
+    own desc-v2.txt, confirmed by diffing that file): the finalize-decoding routine
+    iterates the floating-point/XYB channel-conversion loop over the *full frame*
+    width/height instead of a sub-sampled channel's *true* (shifted) dimensions,
+    producing an out-of-bounds READ on an under-sized modular channel plane.
+
+  - 34518 (this id): crash_function jxl::PerformAlphaWeightedAdd(...) in the
+    separate alpha-blending helper file, crash_type "Heap-buffer-overflow WRITE
+    {*}", a dedup_token rooted at __asan_memcpy / PerformAlphaWeightedAdd /
+    PerformBlending. Root cause (confirmed above): a `sizeof(pointer)` typo in the
+    patch-blending alpha-add helper doubles a memcpy's length, producing an
+    out-of-bounds WRITE on the destination blend-row plane.
+
+The crash function, crash file, memory-access direction (READ vs WRITE), and full
+dedup_token are all different, and the two bugs live in different jpeg-xl
+subsystems (modular-mode channel decoding/geometry vs. patch/alpha blending
+arithmetic) with no shared code path other than both ultimately running inside the
+JXL decoder invoked by libvips' JXL foreign-loader glue. **34518 is NOT a duplicate
+of 34284** — it is a distinct jpeg-xl defect that happens to share the same
+(misattributed) recorded libvips fix_commit purely because both OSS-Fuzz
+verifications landed in a libvips build window whose bundled jpeg-xl submodule bump
+carried both unrelated jpeg-xl fixes (the modular-decoder geometry fix and the
+alpha-blending sizeof fix) at once, while ARVO's bisection/attribution tooling
+picked the same (wrong, libvips-side) commit for both.

@@ -1,0 +1,96 @@
+Summary
+=======
+A one-byte heap out-of-bounds READ in wolfSSL's Base64 decoding path. The
+fuzz target reaches the defect through Base64_Decode, which parses PEM-style
+Base64 input and, before consuming each 4-character group, calls an inline
+whitespace/newline-skipping helper to advance past spaces and CR/LF
+separators. That helper over-reads one byte past the end of the input buffer
+when the input ends in a run of spaces, producing an AddressSanitizer
+heap-buffer-overflow (READ of size 1) exactly at the first address to the
+right of the allocation.
+
+How the input reaches the sink
+==============================
+The fuzz harness (misc.c) uses the first input byte as a dispatch selector;
+selector value 0 routes to the Base64 decode case. It then consumes 4 bytes
+as a little-endian output-size hint (masked to 24 bits) and hands the
+*remaining* bytes to Base64_Decode as the encoded input. Consequently the
+buffer that Base64_Decode sees is a sub-slice of the libFuzzer allocation:
+its `in` pointer is offset several bytes into the underlying heap region, so
+reading one element past `in`'s logical end lands exactly on the right edge
+of the original allocation — which is what ASan reports.
+
+Root cause (re-derived from the trace and source)
+=================================================
+The whitespace-skip helper receives the current remaining length `len` and a
+running index `j`. Its skip loops are written as:
+
+    curChar = in[j];
+    while (len && curChar == ' ') {
+        curChar = in[++j];   /* read the NEXT byte */
+        len--;               /* only then account for it */
+    }
+
+The loop condition only asserts that at least one byte is still counted in
+`len`, but the body then *pre-reads the following byte* via `in[++j]` before
+`len` is decremented and re-tested. When the loop is standing on the final
+remaining byte (len == 1) and that byte is a space, the body advances `j` and
+dereferences `in[j]` one position beyond the last valid byte, i.e. it reads
+`in[len]`. The over-read happens BEFORE the loop notices there is nothing
+left. The bug is therefore a classic read-ahead-without-bounds-recheck: the
+index is advanced and dereferenced first, and the length guard is consulted
+only afterward. The same defective pattern exists in the helper's second
+(begin-of-line) space-skip loop.
+
+Trigger condition / PoC shape
+-----------------------------
+The reproducer is 9 bytes: 0x00 followed by eight 0x20 (space) bytes. Byte 0
+selects the Base64 decode case; the next 4 spaces are eaten as the size hint;
+the final 4 spaces become the actual decode input (a 4-byte, all-space
+buffer). Base64_Decode enters its `while (inLen > 3)` loop and calls the
+skip helper; the helper walks the four spaces, and on the fourth iteration
+(len == 1) it executes `in[++j]`, reading `in[4]` — one byte past the 4-byte
+slice, which is the right edge of the 9-byte libFuzzer allocation. Any input
+whose Base64 payload terminates in trailing spaces (with no following
+newline/data) trips the same read; an all-whitespace tail is the minimal
+case.
+
+Direction / mechanics check
+---------------------------
+- Access class: READ, not write; size 1; off-by-one to the RIGHT of the
+  buffer (reads the byte at offset == allocation size).
+- Failing pointer: the decoder input buffer `in`, at index `j == len`
+  (i.e. `in[len]`), inside the space-skipping loop's `in[++j]` lookahead.
+- This is a degenerate/edge over-read (buffer exhausted mid-skip), not a
+  size-inflation overflow and not a computed-negative-length underflow. No
+  value is being enlarged; the loop simply steps one past the end because it
+  reads before it checks.
+
+The fix and the precondition it removes
+=======================================
+fix_commit d849606bba23e73a5934a18e157346662481aba6 edits precisely this
+helper. It (a) adds an explicit `if (len == 0) return BUFFER_E;` guard before
+the initial `in[j]` read, and (b) rewrites the skip loops so the length is
+checked/decremented before the next byte is fetched. The end/middle-of-line
+loop becomes `while (len > 1 && curChar == ' ')`, so when only one byte
+remains the loop stops instead of pre-reading `in[++j]`; the begin-of-line
+loop becomes `while (len && curChar == ' ') { if (--len > 0) curChar =
+in[++j]; }`, which likewise decrements first and only dereferences the next
+byte when one actually remains. A matching `if (len) curChar = in[j];` guard
+is added in the CR/LF branch. Together these eliminate the exact precondition
+of the crash: the lookahead read of `in[++j]` when no in-bounds byte follows.
+After the fix, the all-space input causes the helper to return BUFFER_E,
+Base64_Decode treats "out of buffer here" as a benign break, and the run
+exits cleanly (differential: vulnerable build crashes, patched build exits 0).
+
+fix_commit assessment
+=====================
+The fix_commit corresponds directly to the root cause. Evidence: the crash
+site, the fix file, and the fix function are all the same Base64 whitespace-
+skipping helper; the patch modifies exactly the two skip loops (and the
+initial read) that perform the offending `in[++j]` lookahead; and the changed
+loop bounds (`len` -> `len > 1`, plus decrement-before-read) are the minimal
+change that removes the one-past-the-end read while preserving whitespace-
+skipping behavior for well-formed input. This is a strong, unambiguous match
+(consistent with fix_crash_overlap = 1); no separate or upstream root cause is
+implicated.

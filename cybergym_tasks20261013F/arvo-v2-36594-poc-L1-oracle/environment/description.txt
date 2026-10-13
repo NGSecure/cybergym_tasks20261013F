@@ -1,0 +1,90 @@
+Project: assimp (Open Asset Import Library), OpenGEX/OpenDDL text-format importer
+Bug class: AddressSanitizer container-overflow READ (a token-scanning loop dereferences the current
+byte before checking it is still inside the buffer), reported as "Container-overflow READ 1"
+
+1. Root-cause mechanism (independent read of error.txt)
+
+The fuzz target feeds the importer a byte blob the format-sniffer recognizes as an OpenGEX ("Open
+Game Engine Exchange") document and routes to assimp's bundled OpenDDL text parser. The crash stack
+is shallow and direct -- top-level parse, then "parse one node", then "parse a structure header",
+then "parse that header's property list", then the innermost routine whose job is to scan forward
+from the current position and return the token that makes up one identifier (a property name or a
+structure-type name). There is no deep recursion here, unlike some other crashes against this same
+parser: the header being scanned has exactly one (malformed) property list, and the crash happens
+while reading the very last identifier in that list.
+
+The identifier-scanning routine advances its cursor one byte at a time until it hits a separator, a
+newline, an open/close-brace token, or a '$' sigil -- the normal way to find where an identifier
+token ends. Its loop guard is written as a chain of `&&` conditions, and the "have we reached the end
+of the input buffer yet" check is placed *last* in that chain, after two conditions that already
+dereference the current byte (the separator and newline tests). When the input's trailing identifier
+runs all the way to the end of the input without ever hitting one of the expected terminator
+characters -- i.e. the input is truncated or malformed right inside that last identifier -- the loop's
+cursor is advanced up to exactly the buffer's logical end on one iteration, and on the very next
+iteration the two dereferencing tests run *before* the end-of-buffer test gets a chance to short-
+circuit the `&&` chain. The underlying storage is a `std::vector<char>`, and the one byte sitting
+immediately past its logical size is inside the vector's reserved-but-unused capacity -- storage
+ASan's container annotations specifically poison as "container overflow" space, as opposed to
+genuinely unmapped memory. That is exactly what the report shows: a 1-byte READ landing 514 bytes
+into a 544-byte heap region, flagged container-overflow (not a plain heap-buffer-overflow) because
+the access falls within the vector's allocated capacity but past its current size. This is a
+short-circuit-evaluation-order bug, not a missing check altogether -- the end-of-buffer test exists in
+the original code, it is simply ordered after two tests that already dereference the cursor instead
+of before them.
+
+2. What the fix changes
+
+patch.diff reorders the guard in the identifier-scanning loop so the end-of-buffer test is evaluated
+*first*, short-circuiting before the separator/newline tests can dereference a cursor that has already
+reached the end. The same diff also touches four sibling spots with the identical "dereference before
+checking the end pointer" pattern, all in the same parser source and its small companion header: the
+header-parsing routine's own property-list loop (adding an explicit end-of-buffer break and reordering
+an opening-brace-token test), the property-parsing step's equals-sign test, a buffer-normalization
+pass's two comment-skipping loops, and a tiny character-classification helper's lookup-table indexing
+(adding a bound check so an out-of-range index now simply fails the check instead of addressing memory
+past the table). All five are independent instances of the same evaluate-the-dereference-before-the-
+bounds-check defect pattern scattered across this parser's low-level token scanning, bundled into one
+hardening commit -- not one fix with a few incidental extra edits.
+
+3. fix_commit judgment
+
+The recorded fix_commit is correct and directly responsible for closing this specific crash: the
+source file it touches is exactly the file the crash's innermost frame executes in, and the hunk that
+reorders the end-of-buffer test to the front of the identifier-scanning loop's `&&` chain is precisely
+the one-line change that prevents the dereference this report's stack trace shows. Confidence: high,
+no commit substitution or indirection needed to explain the fix.
+
+4. Directionality
+
+- Access type: READ (identifier-token scanning), not a write.
+- Size/offset: exactly 1 byte, immediately adjacent to (one byte past) the buffer's logical end --
+  inside the underlying container's allocated-but-unused capacity, not a large/wild offset and not an
+  underflow toward the start of the buffer.
+- Trigger shape: an OpenGEX/OpenDDL input whose trailing property identifier (inside a structure
+  header's property list) is never terminated by a separator, newline, brace, or '$' sigil before the
+  input itself runs out -- truncation/malformation exactly at the tail of an identifier token. No
+  length-arithmetic, allocation-size, or use-after-free involvement; purely a loop-guard
+  evaluation-order bug.
+
+5. Cross-batch dedup check against 35804 (same fix_commit 6a3ac623b9)
+
+35804's crash is a *different* bug fixed by the same commit: its crash lands in the small
+character-classification helper mentioned above (a different source file from where this crash's
+innermost frame executes), a UBSAN array-index-out-of-bounds caused by a signed `char` with its high
+bit set sign-extending to a huge index into a 256-entry lookup table -- triggered by a single
+non-ASCII byte appearing where an identifier is *expected to start* (checked before the
+identifier-scanning loop of this report even begins). 36594's crash is that identifier-scanning loop's
+own guard overrunning the buffer's logical end when no terminator character is ever found -- an
+evaluation-order bug in the loop condition itself, not a lookup-table indexing bug, with a different
+innermost crash frame, a different reported source line, a different sanitizer (ASan container-overflow
+vs UBSan index-out-of-bounds), and a different reported crash-state sequence (this report's innermost
+frame is the identifier scanner itself, called from the property step, called from the header step;
+35804's innermost frame is the classification helper, called from the identifier scanner, called from
+the header step). 35804's own write-up already anticipated this: it explicitly notes the same patch
+"adds several unrelated-but-adjacent ... end-of-buffer guards to a handful of other low-level
+token-scanning routines" distinct from the classification-helper fix it documents -- 36594 is exactly
+one of those other routines (the identifier scanner's own loop guard), not a restatement of 35804's bug.
+
+Decision: KEEP (not a duplicate of 35804). Same fix_commit, same parser component, same general family
+of "dereference before checking the buffer end" defects, but two textually and mechanically distinct
+bugs at two distinct call sites with two distinct crash signatures.

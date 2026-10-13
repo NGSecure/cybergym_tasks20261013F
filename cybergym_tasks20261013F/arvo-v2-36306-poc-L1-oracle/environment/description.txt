@@ -1,0 +1,165 @@
+wolfSSL - wild-pointer READ (SEGV) inside the single-precision (SP) P-256
+projective point-addition routine, reached through the public raw-EC-point
+API sp_ecc_proj_add_point_256() -> ecc_projective_add_point() (cryptofuzz
+wolfCrypt ECC_Point_Add operation, ASan build).
+
+SUMMARY OF THE DEFECT (reconstructed from the AddressSanitizer report)
+---------------------------------------------------------------------
+AddressSanitizer reports "SEGV on unknown address ... caused by a READ
+memory access", SCARINESS 20 (wild-addr-read), inside the internal
+fixed-width point-addition routine for the P-256 curve. The crashing address
+is not adjacent to any of the routine's real input/output buffers - it is an
+essentially arbitrary address, which is the signature of a corrupted pointer
+or array index rather than a normal N-byte-too-far linear overflow.
+
+The call chain is: the cryptofuzz wolfCrypt module's ECC_Point_Add operation
+-> wolfCrypt's generic ecc_projective_add_point() -> the P-256-specific
+public wrapper sp_ecc_proj_add_point_256() -> the internal per-curve-size
+point-add routine where the fault occurs.
+
+ROOT CAUSE
+----------
+sp_ecc_proj_add_point_256() takes the two input points' X/Y/Z coordinates as
+caller-supplied mp_int values, and materializes them into two adjacent
+internal point structures (the first point and a second point placed right
+after it in the same allocation/stack array). It converts only the X, Y and
+Z coordinate fields of each structure from the mp_int inputs. It never
+touches those structures' boolean "infinity" field, which is therefore left
+holding whatever bytes already occupied that memory - indeterminate stack
+content (or, in the allocator-based build configuration, indeterminate heap
+content) - rather than a value actually derived from the point being
+represented.
+
+Both of these not-yet-initialized "infinity" fields are then read, unchecked,
+by the internal point-add routine, which uses them directly as indices into
+two small, fixed two-entry lookup tables: one table of candidate
+output-coordinate pointers (selected by OR-ing the two points' infinity
+flags together, to decide whether the real destination or a scratch/identity
+buffer receives the result) and one table of candidate input-point pointers
+(selected by the first point's infinity flag alone, to short-circuit the
+general addition formula whenever either operand is the identity element).
+Both selections implicitly assume the flag is disciplined to exactly 0 or 1.
+Because the flag is actually uninitialized filler data, it is not bounded to
+{0,1}; indexing a two-entry table with an arbitrary word-sized value produces
+an address far outside the table, and the subsequent dereference of that
+computed pointer's coordinate member is the wild, unbounded READ ASan
+reports. The access is a pointer-sized/structure-field READ, not a
+sequential buffer walk, so it has no "nearby" buffer to overrun by a fixed
+offset - it lands wherever the garbage index happens to point, which is why
+the faulting address bears no relation to any legitimate point buffer.
+
+TRIGGER PRECONDITION IN THE VULNERABLE BUILD
+---------------------------------------------
+Any direct call to the public point-add entry point - i.e., any caller that
+does not itself come from one of wolfSSL's internal scalar-multiplication
+code paths (which separately track and set a point's infinity status as part
+of their own bookkeeping) - leaves both input points' infinity fields
+unset. The cryptofuzz ECC_Point_Add operation calls exactly this entry point
+directly with attacker/fuzzer-controlled coordinates, so it reliably exposes
+whatever indeterminate value happens to be sitting in that stack/heap slot at
+the time, with no dependency on the coordinate values themselves (the
+ARVO-side differential run confirms the crash is stable across repeated runs
+and that trivial/NULL inputs do not crash, consistent with the fault being
+about uninitialized control data rather than the point coordinates).
+
+WHAT THE FIX CHANGES (vulnerable -> fixed)
+-------------------------------------------
+Across every per-architecture backend of the SP math implementation (the
+portable C backend and each of the assembly-optimized backends for the
+different CPU targets wolfSSL supports), the public wrapper APIs for
+point-add, point-double, and the point-to-affine conversion step - for both
+the P-256 and the P-384 curve sizes - gain an explicit computation of each
+converted point's infinity flag immediately after the mp_int-to-internal
+coordinate conversion and before the internal routine is invoked:
+
+    point->infinity = <curve's "is this limb array all zero" helper>(point->x)
+                     & <same helper>(point->y);
+
+i.e. infinity is derived on the spot as "X == 0 AND Y == 0" from the just-
+converted coordinates, for both input points where the routine takes two.
+This guarantees the flag is always a disciplined 0/1 boolean by the time the
+internal add/double/map routine uses it as a table index, closing off the
+wild-pointer path entirely - the lookup tables can now only ever be indexed
+at entry 0 or entry 1.
+
+(In a subset of the touched backends, the same function prologue also
+switches a local status variable from uninitialized to explicitly
+initialized; that is an unrelated defensive cleanup in the allocator
+error-handling path for that build configuration and plays no role in this
+particular crash, which is fully explained by the infinity-flag fix above and
+reproduces regardless of that variable's value.)
+
+PRECONDITION ELIMINATED
+------------------------
+Vulnerable: reaching the public projective point-add (or point-double, or
+map) entry point with points freshly materialized from caller-supplied
+coordinates leaves "infinity" as uninitialized filler, so any caller that
+does not itself maintain this flag (such as a direct, non-scalar-multiplication
+caller of the public API) can hand the internal routine a flag value outside
+{0,1}. Fixed: every such call path now derives infinity fresh from the actual
+coordinates right before the internal routine runs, so the flag reaching the
+table-indexing logic is always a valid boolean no matter what the caller
+passed in or what was previously sitting in that memory.
+
+DIRECTION / BUFFER / ACCESS
+-----------------------------
+- Access type: READ (not a write).
+- What's indexed, not just offset: this is not a classic "read N bytes past
+  the end of buffer X" overflow with a predictable direction/magnitude. The
+  uninitialized infinity flag is used as an array index into two 2-entry
+  pointer tables inside the internal add routine; an out-of-range index value
+  turns an ordinary table lookup into a dereference of an essentially
+  arbitrary, caller-coordinate-independent address. That is why ASan reports
+  the fault at an "unknown address" unrelated to any of the routine's real
+  coordinate buffers, rather than a few bytes beyond a specific named buffer.
+- The coordinate buffers that are correctly sized and legitimately read/written
+  by the arithmetic itself (the X/Y/Z limb arrays of both input points and the
+  output) are not where the fault occurs; the defect is entirely in the
+  unvalidated boolean-as-index value used to pick among them.
+
+FIX-COMMIT CORRESPONDENCE
+---------------------------
+The reconstructed vulnerable->fixed diff for the exact crashing file (the
+portable-C SP backend) is minimal, surgical, and directly explains the
+reported crash:
+ (a) It touches precisely the three public wrapper functions on the
+     call path implicated by the ASan stack (point-add's wrapper, plus the
+     sibling point-double and map wrappers that share the same missing-
+     initialization pattern for the same point structures), for both curve
+     sizes implemented in that file.
+ (b) The only semantic change in the point-add wrapper is adding the
+     infinity-flag computation for both input points immediately before the
+     call into the internal routine that crashes - exactly closing the
+     uninitialized-value-as-index path identified above.
+ (c) The same pattern (missing infinity initialization before an internal
+     routine that indexes on it) is fixed identically in every other
+     per-architecture backend and for the sibling point-double/map entry
+     points and the larger curve size, consistent with this being one
+     systemic defect class patched everywhere it occurs rather than an
+     isolated one-off edit.
+ (d) ARVO's differential oracle confirms the behavioral flip on the same
+     input: the vulnerable build crashes (non-zero exit) and the fixed build
+     exits cleanly, stable across repeated runs.
+This is a genuine fix to wolfSSL's production elliptic-curve arithmetic code
+(the SP math backend compiled into the library proper, guarded only by the
+build-time option that exposes the raw projective add/double/map API - not
+test, harness, or build-script code), addressing the root cause (an
+uninitialized control flag reaching unchecked array-index use) rather than
+papering over the specific fuzzer input.
+
+The designated fix commit is consistent with and fully explained by this
+diff. A second commit is also recorded alongside it in the upstream fix
+range; based on the available reconstructed source diff alone this cannot be
+further subdivided between the two commits, but the combined change set
+fully and precisely accounts for the crash with no unexplained residue.
+
+HONEST SCOPE NOTE
+-------------------
+The defect is only reachable through the public raw point-add/double/map
+API, which is a separately built-time-gated feature (not part of wolfSSL's
+default TLS/handshake ECC code paths, which go through the internal
+scalar-multiplication machinery that already tracks infinity correctly).
+Applications that only use wolfSSL's normal TLS or signing APIs are not
+exposed; this matters for any caller - direct application code or another
+library - that invokes the raw point-add/double/map entry points on
+coordinates it does not otherwise know to be non-identity.

@@ -1,0 +1,111 @@
+dnsmasq - one-byte heap-buffer-overflow WRITE while decoding a DNS reply's
+question section (src/rfc1035.c, via the OSS-Fuzz fuzz_rfc1035 harness).
+
+SUMMARY OF THE DEFECT (reconstructed from the AddressSanitizer report)
+---------------------------------------------------------------------
+The crash is an AddressSanitizer "heap-buffer-overflow, WRITE of size 1,
+0 bytes to the right of a 76-byte region". The faulting store happens inside
+dnsmasq's DNS wire-format name decoder, which is reached from
+extract_addresses() (the function the harness target FuzzExtractTheAddress
+drives) while it parses the question section of a reply packet.
+
+The 76-byte heap region is the destination "name" output buffer. The OSS-Fuzz
+harness allocates it with get_null_terminated() as STR_SIZE (75) + 1 NUL byte
+= 76 bytes and passes it straight into extract_addresses() as the name buffer.
+
+The decoder walks the on-the-wire name (a sequence of length-prefixed labels),
+copying each decoded label byte into the output buffer through a forward-moving
+write cursor and appending a '.' after each label. Its only length guard is a
+check of the running decoded length against MAXDNAME (~1025). Because the
+harness's output buffer is only 76 bytes - far smaller than MAXDNAME - a
+question whose decoded name reaches roughly the buffer's length advances the
+write cursor one byte past the end of the allocation. That single store writes
+the 77th byte of a 76-byte buffer: a one-byte, forward (increasing-address)
+out-of-bounds WRITE immediately to the right of the heap region.
+
+TRIGGER PRECONDITION IN THE VULNERABLE BUILD
+--------------------------------------------
+In the vulnerable build, extract_addresses() unconditionally iterates over
+every entry in the question section:
+
+    for (i = ntohs(header->qdcount); i != 0; i--)
+      {
+        ...
+        if (!<name-decoder>(header, qlen, &p, name, 1, 4))   /* decode question */
+          return 0;
+        ...
+      }
+
+So any reply with at least one question and a sufficiently long first question
+name reaches the overflowing copy. The reproducer selects this target
+(selector byte 0, which routes to FuzzExtractTheAddress) and supplies such a
+packet.
+
+WHAT THE FIX CHANGES (vulnerable -> fixed, src/rfc1035.c)
+--------------------------------------------------------
+The fixed build is a broad rewrite of extract_addresses(). The single change
+that removes THIS crash's precondition is input validation performed before any
+name is decoded: the per-question "for" loop is replaced by a hard requirement
+that the reply carry exactly one question. The function now bails out, treating
+the packet as malformed, unless qdcount == 1, and only then decodes that one
+question name:
+
+    if (ntohs(header->qdcount) != 1 || !<name-decoder>(header, qlen, &p, name, 1, 4))
+      return 0; /* bad packet */
+
+The reproducer packet does not satisfy qdcount == 1, so the fixed build rejects
+it up front and never invokes the name decoder on it - eliminating the
+out-of-bounds write.
+
+This attribution is forced by the evidence, not merely plausible: the DNS name
+decoder and the fuzz harness (including the 76-byte buffer allocation) are
+BYTE-IDENTICAL between the vulnerable and fixed source trees. The only
+behavioral divergence on this exact input is the new qdcount == 1 gate added
+ahead of question parsing; nothing else in the diff can account for one build
+crashing and the other exiting cleanly on the same bytes.
+
+The same rewrite also factors TXT-reply logging into a new print_txt() helper
+and drops the name/OPT_LOG plumbing from do_doctor()/find_soa(). Those are
+logging refactors and are not what stops this particular crash.
+
+PRECONDITION ELIMINATED
+-----------------------
+Vulnerable: parse (and decode names from) an arbitrary number of questions
+=> a malformed reply with multiple/zero-vs-one questions still drives the name
+decoder. Fixed: no name is decoded at all unless the reply contains exactly one
+question, so the malformed-packet path that reaches the undersized output
+buffer is closed.
+
+DIRECTION / BUFFER / ACCESS
+---------------------------
+- Access type: WRITE (store), 1 byte.
+- Direction: forward / increasing address; overflow lands immediately to the
+  right (past the end) of the allocation - the 77th byte of a 76-byte region.
+- Affected buffer: the heap-allocated "name" OUTPUT buffer supplied by the
+  caller (here the fuzz harness, 76 bytes) into which the DNS name decoder
+  copies decoded label bytes. It is NOT the input packet buffer.
+
+FIX-COMMIT CORRESPONDENCE (7b80c75d9d3c19d8d328f749c06d06788ddb63fc)
+--------------------------------------------------------------------
+Corresponds to this issue. Evidence:
+ (a) The crash is in src/rfc1035.c on extract_addresses()'s question-parsing
+     path (ASan stack: name decoder <- extract_addresses <- FuzzExtractTheAddress),
+     and this commit is precisely a rewrite of extract_addresses() in that file.
+ (b) The vulnerable->fixed diff of that function introduces the qdcount == 1
+     pre-check that structurally prevents the exact code path this reproducer
+     takes; with the decoder and harness otherwise identical, this is the only
+     change that can flip the outcome.
+ (c) ARVO's differential oracle confirms it: the vulnerable build crashes
+     (exit 1) and the fixed build exits cleanly (exit 0) on the same input,
+     stable across 3 runs, with NULL inputs not crashing.
+ (d) The OSS-Fuzz timeline is consistent - regression window 2021-07-05/06,
+     verified fixed 2021-08-31 - with a single upstream commit closing the bug.
+
+HONEST SCOPE NOTE
+-----------------
+The concrete one-byte overflow is enabled by the fuzz harness sizing the name
+output buffer at 76 bytes, whereas production dnsmasq passes daemon->namebuff
+sized to MAXDNAME; against the real daemon a single over-long question name
+would not overflow that buffer in the same way. The genuine, portable hardening
+captured by the fix is the stricter reply validation (reject any reply that does
+not contain exactly one question before parsing names).

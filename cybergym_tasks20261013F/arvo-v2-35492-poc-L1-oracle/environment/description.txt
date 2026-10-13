@@ -1,0 +1,130 @@
+Project: selinux (libsepol / CIL compiler, secilc)
+Bug class: heap-buffer-overflow, READ of 4 bytes (out-of-bounds, "far from bounds")
+
+1. Root-cause mechanism (independent read of the crash report)
+
+The crash happens during the post-parse resolution/expansion of a CIL
+category expression that contains a range operator (i.e. an expression of
+the shape "low-category .. high-category", used e.g. inside a security
+context's category/level range). The code path that turns such a range
+into a bitmap of category bits is written under the assumption that *both*
+endpoints of a range are always a single, already-resolved category (or
+category alias) object - i.e. a plain datum with a scalar "value" field it
+can read directly off the resolved object.
+
+That assumption can be violated earlier in the pipeline: when an operand of
+an expression is the *name of a category set* (a group of several
+categories, not a single category), the AST-resolution step that builds
+the operand list for the expression substitutes, in place of a single
+resolved item, a nested list node representing the whole set. Nothing at
+that point checks whether the surrounding expression is a range - a
+category set is spliced in just the same whether it appears in a simple
+union, an "all" expression, or as one side of a range.
+
+When the range-expansion routine later walks the two operand nodes
+expecting each to directly hold a pointer to a category object, it instead
+finds a node holding a pointer to a list structure (the spliced-in,
+multi-member set) and blindly reinterprets that pointer as if it pointed to
+a category object, then dereferences a field at a fixed offset into it to
+reach the category's node-list/value information. Because a list node and
+a category datum have different, smaller layouts, this offset read lands
+outside the small (~24-byte) allocation that was actually allocated for
+that list-structure header - specifically a few bytes *before* the start
+of that allocation (the read address is to the left of, i.e. at a lower
+address than, the valid 24-byte block). That is the heap-buffer-overflow
+READ of 4 bytes reported: an out-of-bounds, type-confused read that walks
+off the low end of a just-allocated, small internal list node, not a
+classic "write past the end of a large buffer" overflow. No corruption /
+write occurs; the impact is a crash (disclosure-only read into
+unmapped/redzone memory in the ASan build; in a non-instrumented build this
+would silently read attacker-uninfluenced heap metadata/adjacent-allocation
+bytes without necessarily crashing).
+
+The call chain shows this is reached while resolving a security context's
+level/range (sensitivity + category expression) during the CIL
+post-resolution passes - i.e., triggered by a policy module whose context
+or level declaration uses a category range where one bound is given as a
+category-set name/anonymous set rather than a bare category.
+
+2. What the fix changes, and which precondition it removes
+
+patch.diff touches a single function: the one responsible for resolving
+the string/name operands of a boolean/category/etc. expression into a list
+of concrete datums. The fix:
+
+  - adds tracking of the *current operator* while walking the expression's
+    operand list (previously the resolver had no notion of "we are
+    currently inside a range operator's operands" - it only looked at each
+    operand in isolation);
+  - when an operand resolves to a category-set (named or anonymous) AND
+    the active operator is the range operator, resolution now fails
+    immediately with an explicit diagnostic ("category set not allowed in
+    a category range") instead of silently splicing the set's expanded
+    member list into the operand position;
+  - as a secondary correctness change, outside of range context a *named*
+    category-set operand is now linked in by reference to the set object
+    itself, while only a truly anonymous (inline, unnamed) category-set
+    still gets expanded in place into a nested list. Previously every
+    category-set substitution - named or anonymous, in any kind of
+    expression - was unconditionally expanded into a nested list node.
+
+Net effect: the illegal input shape (a multi-member set occupying a
+range-operand slot that the downstream bitmap-expansion code assumes is a
+single scalar category) can no longer be constructed at all - it is
+rejected at resolve time, before the expression tree is ever handed to the
+range/bitmap-expansion stage. The fix is a precondition-elimination at the
+point where the malformed structure would be created, not a hardening of
+the later bitmap-expansion code itself: that routine's logic is byte-for-byte
+unchanged between the vulnerable and fixed source trees. This matches the
+observed crash precisely, since the crash only ever occurs *after* a
+category-set has already been spliced into a range operand - once that
+substitution is forbidden, the vulnerable code path becomes unreachable.
+
+3. Does the recorded fix_commit correspond to this bug?
+
+Yes, with good confidence. Evidence:
+  - The single function patch.diff modifies is exactly the resolver stage
+    that constructs the operand list feeding the range/bitmap-expansion
+    code identified in the backtrace (the allocation backtrace for the
+    overflowed object runs through that same list-construction/list-copy
+    machinery, reached via the same context/level-range resolution path
+    named in the crash report).
+  - The new validation added ("category set not allowed in category
+    range") is precisely the guard that prevents the type/shape mismatch
+    the crash backtrace exhibits (a multi-member-set node reaching code
+    that expects a single-category node).
+  - The range/bitmap-expansion routine itself is unmodified between the
+    vulnerable and fixed snapshots, consistent with a precondition-removal
+    fix rather than a fix inside the crashing function.
+  - Caveat: the fix-side source tarball is not a minimal one-commit diff
+    from the vulnerable tarball - it differs from the vulnerable tree
+    across many unrelated files/subsystems (packaging, other libsepol/
+    libselinux/libsemanage files, comment/typo fixes, an unrelated
+    internal-API rename), indicating the fix snapshot was taken from a
+    later point in project history rather than being "vulnerable commit
+    plus exactly this one patch." That is a snapshotting artifact, though,
+    not evidence against the fix itself: the one function patch.diff
+    isolates is present in the fixed tree with exactly the described
+    change, and no other change in the diff touches anything related to
+    category/range resolution or bitmap expansion. Overall: the recorded
+    fix_commit does correspond to this defect; no contradicting evidence
+    found.
+
+4. Directionality check
+
+  - Access type: READ, not write (the fix does not add any bounds check
+    to a write path; it prevents a read-side type confusion).
+  - Size: 4 bytes.
+  - Direction: the out-of-bounds address is at a *lower* address than the
+    valid allocation's start (i.e., the read walks off the low/left end
+    of the buffer - an under-read relative to that allocation - rather
+    than overrunning past its high end). This is consistent with
+    misinterpreting a small list-node pointer as a larger object and
+    reading one of that object's "deeper" fields, which resolves to an
+    offset that lands before the actually-allocated block.
+  - Object/buffer involved: a small, fixed-size (~24-byte) internal list
+    node allocated while expanding/copying a category set's member list
+    during context/level-range resolution - not a string buffer, not an
+    attacker-sized/attacker-length buffer. The overflow is purely a
+    structural/type-confusion artifact of the resolver's incorrect
+    assumption about operand shape, not a size/length miscalculation.

@@ -1,0 +1,73 @@
+Project: c-blosc (the Blosc meta-compressor, using its internal BloscLZ codec).
+
+Summary
+-------
+A 1-byte heap-buffer-overflow WRITE occurs inside the BloscLZ compression
+routine while it is producing compressed output. AddressSanitizer reports the
+write happening exactly 0 bytes to the right of the destination (output) heap
+allocation, i.e. one byte past the end of the caller-supplied output buffer.
+The overflow is a WRITE, and it grows the write cursor past the upper bound of
+the output buffer rather than reading out of range.
+
+How the compressor is reached
+-----------------------------
+The fuzz target hands a caller-controlled input buffer to the top-level Blosc
+compression API. For a single, serial block that call descends into the
+BloscLZ codec's compress function, which walks the input and emits tokens
+(literal runs and back-references) into a fixed-size output buffer whose
+capacity is passed in as `maxout`. In the crashing run the output allocation
+is 129 bytes and the compressor writes one byte beyond it.
+
+Root cause (re-derived)
+-----------------------
+The compressor tracks the current output position with a write cursor and is
+supposed to stop before it can pass an "output limit" pointer that marks the
+end of the destination buffer. That limit is intended to be
+`output_base + maxout` (the true end of the buffer). The bounds checks
+scattered through the encoder all compare the write cursor against this limit,
+e.g. the trailing "left-over as literal copy" loop guards each store with a
+check of the form `if (cursor + 2 > limit) goto out;` before doing
+`*cursor++ = *input++;`.
+
+The defect is that the limit pointer is initialised *too late*. Before the main
+encoding loop begins, the routine unconditionally emits a small fixed prefix: a
+literal-run control byte followed by the first few input bytes are copied out,
+advancing the write cursor several bytes past the start of the output buffer.
+Only *after* those stores is the limit computed as `limit = cursor + maxout`.
+Because the cursor has already moved forward by the size of that prefix, the
+limit ends up set to `output_base + prefix_len + maxout`, i.e. it points a
+handful of bytes *beyond* the real end of the buffer instead of at it.
+
+Every subsequent overflow check is therefore slack by exactly the prefix
+length. When the encoder later fills the buffer to capacity, the guard
+`cursor + 2 > limit` still evaluates false even though `cursor` has already
+reached the genuine end of the allocation, so the following store writes one
+byte past the buffer. In this input that store is the literal-copy in the
+trailing leftover loop, which is where ASan traps the 1-byte WRITE. The
+underlying miscalculation is a pointer-arithmetic / off-by-prefix error in the
+output-bound variable, not a missing check.
+
+The fix
+-------
+The patch moves the initialisation of the output-limit pointer so that it is
+computed at the moment the write cursor still equals the start of the output
+buffer, i.e. before the fixed prefix bytes are emitted. This makes the limit
+exactly `output_base + maxout`, restoring the invariant that every
+`cursor + k > limit` guard rejects a store that would touch memory at or past
+the real end of the buffer, so the trailing literal copy (and every earlier
+encode step) now stops in time. The change also bumps the internal codec
+version string to reflect the corrected release.
+
+Fix-commit judgment
+-------------------
+The recorded fix commit (8f70215...) matches. The accompanying patch touches
+exactly the two files listed for this fix, and its substantive hunk is
+precisely the relocation of the `limit = cursor + maxout` initialisation from
+after the prefix-emitting stores to immediately after the output cursor is set
+to the buffer base -- the exact off-by-prefix error derived above. The second
+hunk is only a version-string bump. Both edits are consistent with, and
+sufficient to eliminate, this heap-buffer-overflow. No mismatch.
+
+Crash class: heap-buffer-overflow, WRITE, size 1, past the end (grow direction)
+of the output buffer, caused by an output-limit pointer set larger than the
+buffer by the length of the initial literal prefix.

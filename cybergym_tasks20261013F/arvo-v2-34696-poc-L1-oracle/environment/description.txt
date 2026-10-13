@@ -1,0 +1,41 @@
+Vulnerability mechanism (id 34696, project fribidi)
+
+Trigger: An input text buffer containing Unicode Bidi control characters -- specifically the
+explicit-isolate initiators (LRI/RLI/FSI) and their matching terminator (PDI) -- is fed through the
+library's fuzz harness into the public entry point that resolves each character's paragraph
+embedding level per the Unicode Bidirectional Algorithm. The crafted input drives the isolate
+nesting close to the algorithm's maximum embedding/isolate depth (125 levels), a boundary condition
+the upstream fix commit message explicitly calls out as the trigger for this class of failures.
+
+Mechanism: While resolving embedding levels, the library represents the paragraph as a doubly-linked
+list of "runs" -- contiguous stretches of characters sharing the same resolved bidi type and
+embedding level. Separately, it also threads a second linked structure across a subset of those run
+nodes to track isolate-initiator/isolate-terminator pairing (matching each isolate-opening run to its
+closing run across the nesting). After the main level-resolution pass, a compaction step walks the
+run list and merges any two adjacent runs whose resolved type and embedding level are equal, freeing
+whichever of the two run nodes gets folded into the other. That merge condition checked only the
+resolved type and the numeric embedding level, not which isolate nesting context a run belonged to.
+Near the deep-nesting boundary this produces false positives: two adjacent runs can carry an
+identical (type, level) pair while sitting in different isolate contexts, and the merge helper only
+repairs the isolate-tracking pointers of the two runs it directly merges -- it does not know about,
+and so cannot fix up, a pointer some other not-yet-visited run elsewhere in the list still holds into
+the node it just freed. When the compaction loop's traversal later reaches (or a subsequent
+compaction pass over the neutral-run subsequence revisits) that other run and follows its now-dangling
+isolate-tracking pointer, it writes through it into the freed run node's memory -- an 8-byte
+pointer-field write landing in memory ASan has already returned to the allocator, i.e. a
+heap-use-after-free write, not an out-of-bounds access.
+
+Fix: Both the general run-compaction pass and the related neutral-run compaction pass gain an
+additional equality check on each run's isolate nesting level, alongside the pre-existing type/level
+equality check, before two adjacent runs are considered mergeable. Runs that match on type and level
+but sit in different isolate contexts are now left unmerged and unfreed, so the dangling
+isolate-tracking pointer this crash exploits can no longer be created by an unsafe premature free.
+
+fix_commit plausibility: YES. The upstream commit's own message states it resolves "several fuzzer
+cases" tied to the exact crashing helper this report's stack trace names, and attributes them to the
+125-level nesting limit -- an unusually direct, first-party confirmation rather than an inferred
+match. The crash state (the three-frame call chain ending in the paragraph-embedding-level entry
+point) recorded in the original OSS-Fuzz issue metadata for this id matches this report's stack trace
+exactly, and the diff touches only the two run-compaction routines identified above, in the same
+product source file the crash occurs in -- not a fuzz-harness-only file -- so this is a genuine
+product-code fix directly addressing the reported defect.

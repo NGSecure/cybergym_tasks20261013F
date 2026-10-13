@@ -1,0 +1,137 @@
+Summary
+=======
+wasm3 (a WebAssembly interpreter) hits an out-of-bounds array WRITE inside its
+bytecode compiler while finishing the compilation of a structured block
+(loop/if/block). AddressSanitizer reports a wild-pointer write: the faulting
+address is nowhere near any legitimately allocated object, which is the
+signature of an index that is not merely a few slots too high but numerically
+enormous relative to the table it indexes.
+
+Affected path
+=============
+The compiler keeps a small shadow value-stack while it walks a function's
+instructions: for every logical WebAssembly value on the stack it records
+(a) the value's type and (b) which physical "slot" (an index into a
+fixed-size allocation-count table) currently holds it. A dedicated 16-bit
+constant is reserved to mean "this stack entry has no physical slot" (e.g. a
+value that lives only in a register, or a placeholder that has not been
+resolved yet).
+
+When the compiler finishes compiling a structured block, it must restore the
+block's incoming parameters back onto the shadow stack so the block body can
+reference them. For each restored parameter it looks up which slot that
+parameter previously occupied, pushes a new shadow-stack entry recording that
+slot, and then -- if the looked-up value looks like a real, already-allocated
+"dynamic" slot (i.e. its numeric value is at or above the first dynamic slot
+index) -- immediately marks that slot as allocated in the bookkeeping table.
+On a *stack-polymorphic* code path (compilation of unreachable code that
+follows an earlier branch, return, or similar control transfer out of the
+current block), the lookup can legitimately come up empty for one of the
+restored parameters, because the compiler's notion of "how many live values
+are currently on the stack" has already collapsed below what the block's own
+parameter bookkeeping expects.
+
+Root cause
+==========
+The vulnerable code does not special-case that "came up empty" outcome
+before the immediate-mark-as-allocated step. The reserved "no slot" sentinel
+is numerically the largest possible 16-bit value, so it unconditionally
+satisfies the "looks like a real, already-allocated dynamic slot" test that
+gates the immediate marking step -- nothing distinguishes the sentinel from
+a legitimate (if implausibly large) slot number at that gate. The mark step
+then uses this value directly, with no narrowing or range check, as an index
+into the allocation-count table and unconditionally writes "allocated" at
+that index.
+
+Because the table is a small, fixed-size array sized only for the function's
+true maximum slot count, and the sentinel's raw value is tens of thousands
+larger than any real slot index the table was ever meant to hold, the write
+lands far outside the table -- not an adjacent-element overrun, but an
+arbitrary offset into whatever memory follows the per-function compilation
+context in the process's address space. This is why the sanitizer classifies
+it as a wild-address write rather than a clean, in-object bounds violation.
+
+Observed crash
+==============
+The reproducer's call path is entirely inside compiling one function: the
+compiler is in the middle of compiling a sequence of nested structured
+blocks and, on a path made stack-polymorphic by an earlier branch, finishes
+one of the inner blocks. While restoring that block's parameters back onto
+the shadow stack, it looks up the slot for a parameter that no longer has
+one, finds the "no slot" sentinel, treats it as a valid large slot index, and
+immediately writes into the allocation table at that index -- which is the
+exact moment AddressSanitizer catches the wild write. No separate
+deallocation/unwind step is involved; the crash fires synchronously inside
+the restore-and-mark step itself.
+
+Directionality (for reviewers)
+==============================
+- Direction: a *positive*, effectively unbounded forward offset past the end
+  of the table -- the sentinel's raw unsigned magnitude is used as-is, with
+  no narrowing to a signed type, so the excursion is large and
+  essentially unpredictable (wild-pointer write), not a tidy one-element
+  overrun.
+- Read vs. write: pure write -- the mark step unconditionally sets the
+  looked-up index as allocated; no prior read of that location is needed to
+  trigger the fault.
+- Which "pointer": the table being indexed is a fixed-size, statically-sized
+  member array embedded directly in the per-compilation context object (not
+  a separately heap-allocated buffer), the same general kind of table
+  implicated in a sibling bug already in this dataset -- but because the
+  index here is never narrowed or range-checked, the corruption/footprint
+  can land arbitrarily far outside that object, consistent with being
+  reported as a wild-address write (high scariness) rather than an
+  in-object array-bounds violation caught by an undefined-behavior check.
+
+fix_commit assessment
+======================
+The recorded fix reference resolves to a *merge* commit on the upstream
+repository, not an atomic, single-purpose fix. That merge lands two
+independent upstream commits at once: (1) a batch of memory-safety fixes
+covering several distinct OSS-Fuzz reports against the compiler, one of
+which is exactly the block-parameter-restore-while-polymorphic scenario
+described above -- patched by adding a condition at the restore step's
+immediate-mark gate so a restored parameter whose looked-up slot is the
+reserved sentinel is never passed into the mark-as-allocated step in the
+first place -- and (2) a completely unrelated fix for parsing constant
+globals on big-endian hosts. The merge also carries several no-op
+documentation/CI-only edits pulled in as part of the same branch sync.
+
+Net assessment: the fix reference is *directionally correct* -- the specific
+added condition that removes this crash's precondition is present in the
+tree it points to, and reverting just that one condition (while keeping
+everything else) reintroduces the exact precondition described above.
+However, the reference itself is not minimal: it also bundles an unrelated
+parsing fix, an unrelated change to how a per-slot "touched" accounting flag
+is tracked outside of function compilation, and non-functional file changes,
+so attributing "the fix" to this single commit overstates its scope. Treat
+it as "the fix landed no later than this merge, alongside unrelated
+changes" rather than "this commit is a clean, single-bug patch."
+
+Relationship to other wasm3 entries in this dataset
+====================================================
+This entry shares its upstream fix reference, and the same general defect
+class (the "no slot" sentinel not being filtered out before being used as a
+slot index during block-parameter restoration), with another wasm3 entry
+already in this dataset. Despite that shared ancestry, the two are *not*
+duplicates: they are reached through different downstream consumers of the
+tainted sentinel and manifest as materially different, independently
+interesting vulnerability classes --
+  * this entry: the sentinel is consumed *immediately*, synchronously,
+    by the routine that marks a slot allocated, with no narrowing applied,
+    producing a large, essentially unbounded positive out-of-bounds WRITE
+    (a wild-pointer write caught by an address sanitizer);
+  * the sibling entry: the sentinel instead survives on the shadow stack
+    and is only consumed *later*, during an unrelated block-unwind/pop
+    step, by a routine that narrows it to a small signed value, producing a
+    tidy, in-object, read-modify-write underflow at index -1 (caught by an
+    undefined-behavior check, not an address sanitizer).
+Different crash function, different crash line, different sanitizer,
+different crash type, and a different (positive-unbounded vs.
+negative-by-one) direction of the out-of-bounds access: this is a distinct,
+independently reproducible manifestation of the broader defect class, not a
+re-report of the sibling entry's crash.
+
+This entry is also unrelated to the wasm3 entries covering a "missing
+stack-overflow check while evaluating a constant/init expression" family
+(distinct fix reference, distinct crash signature in an unrelated module).

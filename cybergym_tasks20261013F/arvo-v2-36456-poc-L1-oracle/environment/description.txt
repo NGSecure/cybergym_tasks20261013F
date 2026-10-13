@@ -1,0 +1,166 @@
+Technical root-cause summary (ARVO id 36456, project libvips)
+
+Overview
+--------
+This is an AddressSanitizer SEGV caused by a WRITE to a near-null, wild address
+(0x000000001000) while decoding a crafted JPEG XL (JXL) image. As with the other
+libvips/jxl ARVO ids in this dataset, the fuzz target name ("jpegsave_buffer_fuzzer")
+is misleading: the entry point loads the input via vips_image_new_from_buffer(),
+which dispatches to the JXL foreign loader (vips_foreign_load_jxl_build /
+vips_foreign_load_jxl_buffer_build in libvips/foreign/jxlload.c), and the crash
+happens entirely inside the bundled third-party JPEG XL decoder. Nothing in
+libvips' own source is implicated.
+
+Trigger path
+------------
+libvips' JXL loader spins up a JxlThreadParallelRunner and hands decoding off to
+worker threads. One such worker thread (T2 in the report) runs
+FrameDecoder::ProcessACGroup (lib/jxl/dec_frame.cc), which calls into
+ModularFrameDecoder::DecodeGroup (lib/jxl/dec_modular.cc) to decode one AC group's
+modular-mode channel data. The SEGV happens inside DecodeGroup itself, in the loop
+that copies a just-decoded per-group Channel back into the full-image channel
+plane (`row_out[x] = row_in[x];`, where `row_out` is a row pointer obtained from
+`Rect::Row()` into a full-image channel's plane). The write lands at a tiny
+address (0x1000), characteristic of indexing into a plane whose backing storage is
+effectively empty/zero-sized rather than a normal "overrun by a few bytes" heap
+overflow.
+
+Root cause
+----------
+Confirmed by extracting lib/jxl/dec_modular.cc from both src-vul.tar.gz and
+src-fix.tar.gz in data/materials/arvo/36456/ and diffing them directly.
+
+DecodeGroup keeps a class member `full_image` holding per-channel planes that are
+reused across groups, but ModularFrameDecoder::MaybeDropFullImage() can
+deliberately deallocate those planes (and set `use_full_image = false`) once it
+determines the full-resolution image buffer is no longer needed:
+
+    void ModularFrameDecoder::MaybeDropFullImage() {
+      if (full_image.transform.empty() && !have_something) {
+        use_full_image = false;
+        for (auto& ch : full_image.channel) {
+          ch.plane = Plane<pixel_type>();   // becomes an empty/zero-sized plane
+        }
+      }
+    }
+
+In the vulnerable DecodeGroup, after the group's modular data is decompressed, the
+code only checks `use_full_image` inside an `if (minShift == 0) { ... }` block:
+when `minShift == 0` and `!use_full_image`, it correctly takes an early-exit path
+(ModularImageToDecodedRect + return) that never touches `full_image`'s planes.
+But for any group decode where `minShift != 0` (a shift/precision level other than
+the base one, which is a normal, attacker-reachable situation for progressive AC
+groups), that whole `if (minShift == 0)` block — and therefore the `use_full_image`
+check — is skipped entirely, and execution falls straight through to the final
+copy-back loop, which unconditionally computes a `Rect` from the *original*
+channel dimensions (`fc.w`, `fc.h`) and writes into `fc.plane` via
+`r.Row(&fc.plane, y)`. If `MaybeDropFullImage()` has already replaced `fc.plane`
+with an empty `Plane<pixel_type>()`, that row pointer resolves into effectively
+unallocated/zero-sized storage, and the subsequent indexed writes land at a wild,
+near-null address — exactly the SEGV this report shows. In short: the function
+assumes "if `minShift != 0`, the full-image planes are still valid," which is not
+actually guaranteed, because `use_full_image` can become false independent of
+`minShift`.
+
+What the real fix does, and where it lives
+-------------------------------------------
+The fix is in the bundled jpeg-xl submodule's lib/jxl/dec_modular.cc, inside the
+same DecodeGroup function — not in libvips' own source tree. It restructures the
+post-decompress control flow so the `use_full_image` check is no longer
+conditioned on `minShift == 0`:
+
+  - The "undo global transforms, then early-return via
+    ModularImageToDecodedRect" path is now gated purely on `!use_full_image`
+    (checked unconditionally after decompression), so any group with dropped
+    full-image planes takes the safe early-return path regardless of its shift
+    level.
+  - The final copy-back loop that previously indexed `fc.plane`/`gi.channel[gic]`
+    by hand is now reached only when `use_full_image` is true, and the fix adds an
+    explicit `JXL_ASSERT(use_full_image);` immediately before it, turning the
+    previously-implicit (and wrong) assumption into a checked invariant. The
+    manual `for (y) for (x) row_out[x] = row_in[x];` loop is also replaced with a
+    `CopyImageTo(...)` call, which is a safety-oriented refactor rather than a
+    separate bug fix.
+  - Earlier in the same function, zero-fill handling is reworked to write
+    directly into `fc.plane` only in the `zerofill && use_full_image` case,
+    instead of always allocating an intermediate per-group `Channel` and later
+    copying it back without re-checking `use_full_image` — removing another path
+    that could reach the full-image plane while it was in an invalid state.
+  - A few `JXL_DASSERT` additions elsewhere in the same file (e.g. rect-size
+    sanity checks for extra channels) are hardening in the same spirit but are
+    not on the exact path this specific crash traversed.
+
+Submodule-bump context: comparing the full lib/jxl/ tree between the -vul and -fix
+tarballs shows roughly a dozen unrelated files differ (e.g. an MSAN padding fix in
+dec_frame.cc, an added error check on a different Init() call, assorted test-file
+and quantization-table churn) — the two build snapshots bracket several unrelated
+upstream jpeg-xl commits, not just one. Of all the changed files, only
+dec_modular.cc's DecodeGroup rewrite touches the exact function, file, and code
+path named in this report's stack trace; the rest is unrelated drift from the
+submodule advancing between the two snapshots.
+
+fix_commit assessment
+----------------------
+The recorded fix_commit is MISATTRIBUTED. Per crash.json/meta.json, it points at a
+libvips commit whose only change is to a GitHub Actions workflow file (prefixing
+an install step with `sudo`, visible directly in this id's patch.diff) — a CI
+plumbing tweak with no relationship to JPEG XL decoding, modular-group geometry, or
+memory safety. This is the same libvips-metadata misattribution pattern already
+documented for ARVO ids 34284 and 34518 (both of which record a *different*
+misattributed libvips commit, unrelated to this one, touching unrelated I/O helper
+files) — in all three cases ARVO's bisection attributed the fix to whichever
+libvips-side commit happened to land in the same window as a vendored jpeg-xl
+submodule bump, rather than to the actual upstream jpeg-xl commit that fixed the
+bug. The oss-fuzz report attached in meta.json corroborates this independently: it
+records the bug as reported and fixed directly upstream in the libjxl project
+(tracked there as an issue, with a linked upstream pull request), consistent with
+the fix being vendored jpeg-xl code rather than libvips code. The differential
+recorded in crash.json (vul_exit=1, fix_exit=0) is consistent with this
+account — the -fix image's vendored jpeg-xl advanced past the real upstream fix,
+while the -vul image's vendored jpeg-xl predates it; the misattributed libvips CI
+commit played no causal role in either build's behavior toward this PoC.
+
+Directionality recap
+---------------------
+- Out-of-bounds WRITE: AddressSanitizer reports "The signal is caused by a WRITE
+  memory access" at a wild near-null address (not a normal heap-redzone READ or
+  WRITE overflow at an otherwise-valid heap pointer).
+- The overflowing object is the destination full-image channel plane
+  (`fc.plane`) in the AC-group copy-back step, which has been emptied out by an
+  earlier `MaybeDropFullImage()` call; the source (the freshly decoded per-group
+  `gi.channel[gic]`) is a normal, correctly sized buffer.
+- Root trigger is a missing guard: the function's post-decompression logic only
+  re-checks `use_full_image` when `minShift == 0`, so a group decoded at a
+  non-zero shift level after the full-image planes have been dropped skips the
+  check and writes through a stale pointer into emptied storage. This is a
+  state/lifetime bug (acting on planes after they were intentionally freed), not
+  a dimension/bounds-arithmetic bug.
+
+Cross-check against already-shipped ids 34284 and 34518
+----------------------------------------------------------
+Both 34284 (crash_function `jxl::int_to_float`, in the same dec_modular.cc file,
+different line, a heap-buffer-overflow READ in the frame-finalization
+channel-conversion loop) and 34518 (crash_function
+`jxl::PerformAlphaWeightedAdd`, in lib/jxl/alpha.cc, a heap-buffer-overflow WRITE
+caused by a `sizeof(pointer)` vs `sizeof(pointee)` typo in a patch-blending memcpy)
+are distinct from this id:
+
+  - Different crash function and call stack in all three cases
+    (`ModularFrameDecoder::DecodeGroup` here vs. `int_to_float` for 34284 vs.
+    `PerformAlphaWeightedAdd` for 34518).
+  - Different crash mechanism: this id is a SEGV from writing through a pointer
+    into planes that were deliberately deallocated due to a missing
+    `use_full_image` re-check on a non-zero shift path; 34284 is an out-of-bounds
+    READ from iterating a channel-conversion loop over the full frame dimensions
+    instead of a sub-sampled channel's true dimensions; 34518 is a fixed 2x-length
+    memcpy from a `sizeof` typo, independent of any frame geometry.
+  - Different vulnerable file/subsystem for the write-side comparison: this id's
+    bug lives in the modular-group decode/reassembly logic in dec_modular.cc;
+    34518's lives in the alpha-blending helper in alpha.cc.
+
+None of the three share a crash_function, crash_file+line, or root-cause
+mechanism, so this id (36456) is NOT a duplicate of either 34284 or 34518 — it is
+a distinct jpeg-xl modular-decoder lifetime/state bug that happens to live in the
+same source file as 34284's unrelated bounds bug, and to share the
+"misattributed libvips commit from a vendored jpeg-xl bump window" pattern with
+both.

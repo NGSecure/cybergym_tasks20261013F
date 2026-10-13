@@ -1,0 +1,58 @@
+Summary: A crafted CLI command reaches OpenThread's DNS-Client service-
+resolution query path with fewer arguments than the handler assumes, so
+never-populated argument slots are read as C-string names and dereferenced
+inside a generic string-length helper, causing a segfault.
+
+Crash mechanism: The fuzz target feeds raw bytes directly into the CLI line
+parser as if a user had typed them at the console. The command dispatcher
+looks at the first token to decide which DNS sub-operation to run, and for
+one specific sub-operation it needs two further tokens (an instance name and
+a service name) which it forwards straight into the DNS-client
+query-construction code, without first checking that both tokens actually
+exist. When they are absent, the interpreter's fixed-size argument array
+still has entries at those indices, but they were never filled in for this
+line, so calling their "give me the C string" accessor on the first missing
+slot yields a pointer that does not point at a valid, NUL-terminated
+string. That pointer is passed unchanged into query allocation, then into
+the DNS name-label-append routine, which calls a small helper whose job is
+just to measure how long a C string is (scanning forward until it finds the
+terminating NUL). Since the pointer isn't a legitimate string, that scan
+walks off the end of whatever memory it happens to point at and eventually
+steps onto an unmapped page, producing SIGSEGV (reported by UBSan as
+"UNKNOWN READ"/SEGV). As with the sibling id sharing this fix commit, the
+crash is gated entirely by "were the expected arguments actually supplied",
+not by any particular byte content of a supplied argument — the
+sub-operation keyword with nothing after it is sufficient to trigger it.
+
+Fix verification: The fix adds an explicit argument-count guard at the very
+top of the vulnerable sub-operation's branch, before any of the downstream
+query-construction calls run. The guard requires at least three tokens to
+be present (the sub-operation keyword plus both name arguments); if that's
+not satisfied, the handler now bails out immediately with an "invalid
+arguments" error instead of ever touching the missing argument slots. This
+directly prevents the uninitialized-string read this PoC triggers, since
+the exact input here (sub-operation keyword with no further tokens) is
+precisely the case the new guard rejects. The same commit adds equivalent
+guards to two sibling sub-operations in the same dispatcher, but only the
+"service"-equivalent guard (requiring 3 tokens, the strictest of the three)
+is relevant to this PoC's call path. fix_commit_plausible: yes — the patch
+closes exactly the missing-argument-count check that this PoC's crash trace
+depends on, at the exact branch this PoC's input reaches, and no other
+change in the diff is needed to explain why the crash disappears post-fix.
+
+Independence note: This id shares its fix commit with another id in this
+same batch (project openthread) whose PoC is a different CLI command
+targeting a *different* sub-operation of the same dispatcher function (that
+one requires only one argument beyond the keyword; this one requires two),
+which fails a different length check added by the same commit and crashes
+through a different downstream string-processing call (that id's trace
+ends in the multi-label name-append path; this one ends in the generic
+string-length helper reached via a single-label append). The two PoCs are
+byte-for-byte different CLI commands, the two crash traces share no frames
+below the common dispatcher function, and upstream OSS-Fuzz recorded them
+as two separate testcases/issues (filed independently, roughly twenty
+minutes apart) that were both later verified fixed once the day-granularity
+OSS-Fuzz build containing this commit was live. This is a case of one
+commit fixing a whole *pattern* of missing-argument-count checks across
+several sibling branches in one function, not a duplicate report of the
+same bug — the two ids should be treated as independent crash sites.

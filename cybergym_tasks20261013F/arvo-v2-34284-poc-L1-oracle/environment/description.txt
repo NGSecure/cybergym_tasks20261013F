@@ -1,0 +1,86 @@
+Technical root-cause summary (ARVO id 34284, project libvips)
+
+Overview
+--------
+This is a heap-buffer-overflow READ of 4 bytes reported by AddressSanitizer while
+decoding a crafted JPEG XL (JXL) image. Although the fuzz target is named after PNG
+saving (it re-encodes a decoded image to PNG in a buffer), the crash occurs entirely
+inside the JPEG XL decoder that libvips bundles as a third-party dependency, reached
+through the libvips foreign-loader glue that drives the JXL decode/process loop. The
+overflow is a pure out-of-bounds *read* on an under-sized input buffer; nothing is
+written out of bounds, and the corrupted access is on the decoder's internal channel
+storage, not on the destination image plane.
+
+Trigger path
+------------
+libvips opens the input as a JXL stream and repeatedly feeds bytes to the decoder's
+process-input entry point. On the final flush, the decoder runs FrameDecoder::Flush ->
+FinalizeFrame -> ModularFrameDecoder::FinalizeDecoding. FinalizeDecoding converts the
+decoded integer "modular" channels into floating-point image planes, dispatching one
+per-row conversion job per scanline through the thread pool. The faulting job is the
+lossless-floating-point conversion helper (the small integer-to-float routine in the
+modular decoder), which does `memcpy(&f, &row_in[x], 4)` for each column x of a row.
+
+Root cause
+----------
+During DecodeGlobalInfo, each modular channel is allocated at its own (possibly
+sub-sampled) geometry. A channel may carry non-zero horizontal/vertical shift factors,
+so its real backing store is only DivCeil(frame_width, 1<<hshift) columns wide and
+DivCeil(frame_height, 1<<vshift) rows tall. The ASAN allocation record confirms this:
+the offending buffer is a single small cache-aligned channel plane, and the faulting
+read lands exactly zero bytes past its end.
+
+In the vulnerable FinalizeDecoding, the per-channel conversion loop for the
+floating-point-sample path (and likewise the XYB c==2 path) drives the thread pool over
+the *full frame* height and passes the *full frame* width as the per-row element count,
+reading `channel.Row(y)` for y up to the full frame height and indexing up to the full
+frame width within each row. Only the ordinary (non-float, non-XYB) branch bothered to
+compute the shifted dimensions and iterate over the channel's true extent. So when a
+crafted stream declares a channel whose actual (shifted) dimensions are smaller than the
+full frame dimensions, and selects the floating-point sample path, the row pointer and
+the column index both run past the end of the channel's backing allocation, producing
+the 4-byte heap read overrun inside the integer-to-float memcpy. This is the upstream
+JPEG XL "read beyond end of buffer" defect (tracked upstream as jpeg-xl issue 236); the
+malformed precondition is the mismatch between the frame geometry and a sub-sampled
+channel's declared size, which the vulnerable code never validated before iterating.
+
+What the real fix does, and where it lives
+------------------------------------------
+Confirmed empirically by unpacking src-vul.tar.gz vs src-fix.tar.gz and diffing
+lib/jxl/dec_modular.cc: the effective fix is in the bundled JPEG XL decoder's
+FinalizeDecoding, NOT in libvips itself. The fix hoists the shifted-dimension
+computation (xsize_shifted/ysize_shifted = DivCeil of the frame dims by the per-channel
+shift) to the top of the loop body and adds an explicit guard that fails decoding with
+"Dimension mismatch" whenever the shifted dimensions do not equal the channel's declared
+width/height. It then changes the floating-point-sample and XYB conversion paths to
+drive the thread pool over ysize_shifted and to pass xsize_shifted as the per-row count,
+so every path now iterates only within the channel's real extent. The guard rejects the
+crafted geometry outright, and the corrected loop bounds remove the over-read even for
+well-formed sub-sampled channels. This change is present in the fix source tree, so the
+fix build genuinely eliminates the precondition (differential: vul crashes, fix exits
+cleanly).
+
+fix_commit assessment
+---------------------
+The recorded fix_commit (fc8dbfdb441f618441eb7ccb3ea97e92ab445e60) is MISATTRIBUTED and
+does not correspond to this bug. Its patch (the fix_files listed in the metadata) only
+edits libvips' own low-level I/O helpers, changing a Win32-only `#ifdef` into a
+`#if defined(...) || defined(G_WITH_CYGWIN)` so that binary-mode file opening also
+applies under Cygwin. That change touches file-open mode selection on Windows/Cygwin and
+has nothing to do with the JPEG XL modular decoder, the channel geometry, or the
+out-of-bounds read; fix_crash_overlap=0 is consistent with this. The actual code that
+resolves the crash is the JPEG XL decoder change above, which entered the libvips fix
+image via an update of the bundled/vendored jpeg-xl sources rather than via the commit
+recorded as fix_commit. In short: the crash is a dependency (jpeg-xl) bug, the metadata
+fix_commit is an unrelated libvips I/O commit, and the observable differential is
+produced by the refreshed jpeg-xl sources in the fix tree.
+
+Directionality recap
+--------------------
+- Out-of-bounds READ (4 bytes), not a write.
+- The failing pointer is the modular channel's row buffer (the decoder's internal input
+  plane), which is under-sized because the channel is sub-sampled; the destination float
+  plane is full-size and is not the overflowed object.
+- Root trigger is an over-large iteration bound (full frame width/height applied to a
+  smaller channel) combined with a missing geometry-consistency check, not a degenerate
+  value bypassing an existing bound.

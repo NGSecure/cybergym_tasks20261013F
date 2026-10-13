@@ -1,0 +1,52 @@
+Crash type: AddressSanitizer SEGV, wild-address READ (SCARINESS 20, wild-addr-read), inside
+__asan_memcpy called from the Apple maker-note loader in libexif's apple/exif-mnote-data-apple.c.
+
+Call path (from error.txt):
+  vips_image_new_from_file -> heifload build/header -> vips_foreign_load_heif_set_header ->
+  vips_image_set_blob -> vips_image_set -> vips__exif_parse -> vips_exif_load_data_without_fix ->
+  exif_data_load_data -> interpret_maker_note -> exif_mnote_data_load -> (Apple maker-note loader)
+  -> __asan_memcpy -> SEGV.
+
+Mechanism (re-derived from the trace, not copied from any patch):
+The crashing fuzz target loads a file with vips_image_new_from_file(); the loader path goes through
+libvips' HEIF/EXIF metadata extraction, which hands the raw EXIF "maker note" bytes embedded in the
+input file to libexif's generic EXIF parser (exif_data_load_data -> interpret_maker_note ->
+exif_mnote_data_load). Because the maker-note vendor tag identifies the note as an Apple maker note,
+dispatch lands in libexif's vendor-specific Apple maker-note loader, whose job is to walk a small
+internal IFD-like tag table embedded in the maker-note blob and, for each tag entry, copy that
+entry's payload out of the original EXIF buffer into a per-entry data buffer via a memcpy() call.
+The offset/length fields used to locate each tag's payload are read directly from the
+attacker-controlled maker-note bytes and are used to compute the memcpy() source pointer (the
+original EXIF buffer base plus that untrusted offset) and the copy length, without validating that
+the resulting [base+offset, base+offset+length) range actually stays inside the bounds of the
+maker-note/EXIF buffer that was allocated for the file. With a crafted, undersized or truncated
+maker-note table, offset (and/or length) can be arbitrarily large, so the computed source pointer
+lands far outside the allocated buffer entirely (the crash address 0x61c10000080b is nowhere near a
+normal heap object address pattern, consistent with the "wild-addr-read" classification rather than
+a small few-byte heap-buffer-overflow) — the process then SEGVs when __asan_memcpy dereferences that
+wild pointer.
+
+Direction: this is an out-of-bounds READ (not write) that GROWS past the end of the source
+(maker-note/EXIF data) buffer — the memcpy() source pointer inside the Apple maker-note loader,
+derived from an unvalidated tag offset, is the variable that escapes the buffer; the destination
+(the newly allocated per-entry data buffer, sized to the attacker's own "count"/length field) is not
+the object being overrun here.
+
+fix_files: empty in crash.json, so no patch.diff exists for this id and none was read — consistent
+with the two comments recorded in meta.json.
+
+fix_commit judgment: fix_commit may be wrong. crash.json/meta.json record fix_commit
+d9191588abb7c73163b9536efea053893e48d14a as a commit in the chromium.googlesource.com/webm/libwebp
+repo, and the ARVO "project" field for this id is "libwebp". But the OSS-Fuzz report embedded in
+meta.json explicitly states the fuzzing job's real project is libvips (Fuzz Target:
+jpegsave_file_fuzzer, Job Type: honggfuzz_asan_libvips), matching the stack trace above (which never
+touches any libwebp code at all — every frame is libvips/libheif/libexif). A follow-up OSS-Fuzz
+comment from a libvips maintainer states directly: "This is an upstream bug in libexif introduced
+via https://github.com/libexif/libexif/pull/71 and fixed via
+https://github.com/libexif/libexif/commit/22799320cc1187868d9a572661d12f0c3f9939b5 and
+https://github.com/libexif/libexif/commit/dbead19ed27af4381e514d8879f58c7d441bc6b2" — i.e. the real
+upstream fix lives in the libexif GitHub repository as two separate commits, not in the webm/libwebp
+repository at all. The recorded fix_commit therefore points to the wrong upstream project/repo
+(and crash.json's fix_files being empty is consistent with that hash not resolving to any file diff
+relevant to this bug). Root-caused component: libexif's Apple maker-note parser
+(apple/exif-mnote-data-apple.c), reached here via libvips' EXIF metadata extraction, not libwebp.

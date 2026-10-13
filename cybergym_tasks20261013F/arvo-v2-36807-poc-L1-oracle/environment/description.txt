@@ -1,0 +1,43 @@
+A crafted PHP script triggers a heap-use-after-free read inside the Zend engine's handler for a
+single compound array-write opcode -- the one used for an append-by-reference onto an array
+(the `$arr[] =& $x;` pattern, where a bare `[]` supplies no explicit key and the value operand is
+itself a variable holding a just-created reference) -- because that one handler frees its own
+value operand partway through doing the append and then, a few steps later while still inside the
+same handler, reads through that same operand again before it is done.
+
+Root cause: the engine first executes a small, separate step that wraps the right-hand value in a
+reference cell (a newly heap-allocated, refcounted wrapper distinct from the value it points at).
+Control then passes to the append-by-reference opcode handler, which is supposed to consume that
+reference and store it as the array's new last element. While consuming its operand, the handler
+calls the generic "this slot is done, release what it was holding" teardown path on the very zval
+that holds the reference -- and because nothing else has taken out an additional claim on the
+reference at that point, this teardown drops its only reference count to zero and the reference
+wrapper is immediately freed. The handler, however, is not actually finished: later in its own
+body it still needs to go back through that same operand slot -- most likely to finish wiring the
+freshly appended slot into the array's internal structure, or to hand the stored value back as the
+expression's own result -- and that later access performs a small, fixed-size read (matching the
+size of the reference wrapper's own refcount/type header) straight into the memory that was just
+freed a handful of instructions earlier in the identical function. In short: this is a single
+opcode handler double-using one operand -- release it, then read it again -- without first
+checking whether the release already took the operand's last owning reference, not a reentrancy
+or cross-frame ordering bug of the kind that shows up when a destructor callback runs arbitrary
+PHP code in the middle of something else. The PoC needs no external input beyond the script text
+and reproduces deterministically every run.
+
+Is the fix plausible: no. The recorded fix commit's diff is four small, mechanical hunks, and none
+of them touches array handling, reference wrappers, opcode handlers, or refcounting logic -- each
+one only changes how a single environment-variable string is parsed into a number (one controls a
+debug trace-emitting feature, one controls debug-heap behavior on a platform this build doesn't
+even compile for, one controls an unrelated ini setting's numeric parsing, and one controls which
+low-level memory-allocation backend the interpreter's process-wide allocator uses). That last hunk
+is the one that actually explains why the crash stops reproducing after this commit, but not
+because it fixes anything: this build's own allocation/free trace shows every allocation and
+release going through a tracked/instrumented allocation backend rather than the interpreter's
+normal internal memory-pooling allocator, which is what lets a sanitizer see a release at
+object granularity in the first place. The fix commit's env-var-parsing hunk for exactly that
+allocator-selection switch flips the comparison's sense, so the build that previously opted into
+the tracked backend silently falls back to the interpreter's own pooling allocator afterward --
+and a pooling allocator recycles freed slots invisibly, so the exact same double-use-of-one-
+operand defect in the opcode handler keeps happening, it simply stops being something an external
+memory checker can observe. This is a visibility-masking side effect of an unrelated cleanup
+commit, not a repair of the underlying array/reference bug.

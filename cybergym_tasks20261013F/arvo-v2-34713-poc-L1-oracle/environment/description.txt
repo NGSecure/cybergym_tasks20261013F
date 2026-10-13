@@ -1,0 +1,101 @@
+Summary
+=======
+A stack-buffer-overflow WRITE in wolfSSL's OCSP response parser. While
+decoding a Basic OCSP Response, the code that handles one per-certificate
+status entry copies two length-prefixed DER OCTET STRING fields (the
+issuer-name hash and the issuer-public-key hash) into a pair of fixed-size
+digest buffers embedded in a response-list entry structure, using the
+attacker-controlled DER length directly as the copy size with no check that
+it fits the destination. An encoded length larger than the fixed buffer
+(each sized to hold a single hash digest, i.e. a small, constant number of
+bytes) makes the copy write past the end of that buffer. In the reproducer
+the entry structure lives on the stack (inside the fuzz target's own call
+frame), so the overflow corrupts an adjacent stack-allocated structure and
+AddressSanitizer reports a stack-buffer-overflow write.
+
+How the input reaches the sink
+==============================
+The harness hands the raw fuzz bytes straight to the top-level OCSP response
+decoder, which validates the outer DER wrapper, locates the "basic" OCSP
+response, and walks its list of per-certificate response entries. For each
+entry it decodes a CertID (hash algorithm identifier plus the two hash
+octet strings) followed by a certificate status and timestamps. It is while
+decoding that CertID's two hash fields that the vulnerable copy happens: the
+parser reads a BER/DER length prefix for each OCTET STRING and then copies
+exactly that many bytes into the entry's fixed hash fields.
+
+Root cause (re-derived from the trace and source)
+==================================================
+The length used for each `XMEMCPY` into the fixed digest field comes
+straight from `GetOctetString`'s parsed DER length, with no validation
+against the destination field's actual capacity before the copy executes.
+Both hash fields in the per-entry structure are declared as fixed-size byte
+arrays sized to hold exactly one digest (the project's standard OCSP digest
+size, effectively a small constant such as a SHA-1-length hash). Because the
+DER length is fully attacker-controlled and the decoder trusts it as-is, an
+OCSP response that declares an oversized hash (larger than the fixed field)
+causes the copy to write past the end of that field and into whatever
+memory follows it in the containing structure/frame — a classic
+size-inflation buffer overflow (unchecked externally-controlled length used
+directly as a memcpy size), not an off-by-one or a signedness/underflow bug.
+
+Trigger condition / PoC shape
+------------------------------
+The crash trace shows a write of significantly more bytes than the fixed
+field can hold, landing just past the end of a stack-resident per-entry
+structure and clipping the edge of a neighboring stack variable. Any
+syntactically valid Basic OCSP Response whose SingleResponse/CertID encodes
+an issuer-hash or issuer-key-hash OCTET STRING longer than the fixed digest
+size reaches this path and overflows the destination by (declared length -
+fixed size) bytes; no other preconditions (specific hash algorithm, status
+value, etc.) are required.
+
+Direction / mechanics check
+----------------------------
+- Access class: WRITE, not read; overflow runs to the right of (past the
+  end of) the fixed destination buffer.
+- Failing operation: a fixed-size-destination `XMEMCPY` whose length
+  argument is an unchecked, attacker-supplied DER octet-string length.
+- This is a size-inflation defect (the copy length itself is too large for
+  the destination), distinct from a read-ahead/off-by-one pattern and
+  distinct from an index/length underflow — the destination capacity is
+  simply never compared against the declared source length before the copy.
+
+The fix and the precondition it removes
+========================================
+The real fix for this crash site adds, immediately before each of the two
+hash-copying `XMEMCPY` calls, an explicit guard that rejects any decoded
+length exceeding the destination field's fixed capacity (returning a
+buffer-size error instead of copying), for both the issuer-name-hash and
+the issuer-key-hash fields. This directly removes the precondition of the
+crash: after the fix, an OCSP response whose declared hash length exceeds
+the fixed digest size is rejected before any copy occurs, so the vulnerable
+build's differential behavior (vulnerable build crashes / patched build
+exits cleanly) disappears. The same commit additionally hardens an
+unrelated spot in the entry-list growth logic one level up the call chain
+(the code that appends a new per-entry list node), preserving a pointer
+field that was previously clobbered by a bulk zero-initialization of the
+newly linked entry — a separate defensive fix bundled in the same commit
+but not implicated in this particular stack-overflow crash, since it sits
+in the caller that walks the list rather than in the per-entry field-copy
+code where the overflow actually occurs.
+
+fix_commit assessment
+======================
+The metadata's recorded single "fix_commit" hash is a same-day, same-ticket
+companion commit that adds a new PKCS#8 key-decryption API/refactor — it
+touches a completely different area of the ASN module (private-key
+decrypt/encrypt helpers) and does not modify the OCSP response-decoding
+path at all, so by itself it does not explain or fix this crash. The actual
+crash-matching change — the two destination-capacity checks described above
+— lives in the *other* commit listed alongside it in the metadata's
+fix-commit-list field (also same day, same tracking ticket, titled around
+"several ASN decoder fixes"); that second commit is also what the
+project-metadata's own top-level "fix" link points to. In other words: the
+single fix_commit value attached to this crash is a misattribution (it is a
+companion/sibling commit, not the one that patches the crash site), while
+the correct fix is present and identifiable among the broader fix-commit
+list. Despite that misattribution, fix_crash_overlap=1 is justified because
+the actually-matching commit is available in that list and its diff lines
+up exactly with the crash site, crash function, and crash mechanism
+described above.
